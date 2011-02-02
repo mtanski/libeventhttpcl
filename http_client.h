@@ -36,6 +36,7 @@ struct http_response
 
   size_t            body_len;
   const char       *body;
+  bool              body_chunked;
 
   TAILQ_HEAD(,http_header) headers;
 };

@@ -113,6 +113,7 @@ static int      read_data(struct http_client *api);
 static int      write_request(struct http_client *api);
 static void     connection_fault(struct http_client *api, enum connection_fault fault);
 static int      next_request(struct http_client *api);
+static BIO*     connect_remote_host(struct http_client *api);
 
 
 /*======================================================================================================================
@@ -324,8 +325,8 @@ bool is_response_chunked(struct http_client *api, struct http_response *response
 int find_body_len(struct http_client *api, struct http_response *response)
 {
   if (is_response_chunked(api, response)) {
-    /* TODO: Implement me */
-    return -1;
+    response->body_chunked = true;
+    return 0;
   }
 
   ssize_t body_len = get_body_len(response);
@@ -467,8 +468,10 @@ int dispatch_response(struct http_client *api, struct http_response *response)
   /* Get rid of the body from the buffer. */
   evbuffer_drain(api->input, response->body_len);
 
-  /* Disconnect */
-  if (is_connection_close(api, response)) {
+
+  if (response->body_chunked == true) {
+    /* Chunked, already closed connection */
+  } else if (is_connection_close(api, response)) {
     if (response != NULL) {
       connection_fault(api, FAULT_CLOSE);
     }
@@ -481,6 +484,8 @@ int dispatch_response(struct http_client *api, struct http_response *response)
   free_request(request);
 
   api->current = NULL;
+
+  return 0;
 }
 
 static
@@ -646,6 +651,17 @@ void connection_fault(struct http_client *api, enum connection_fault fault)
     }
   }
 
+  if (fault == FAULT_CLOSE && api->current) {
+    if (api->current->body_chunked == true) {
+      /* Set the length, it's the whole buffer. */
+      api->current->body_len = EVBUFFER_LENGTH(api->input);
+
+      dispatch_response(api, api->current);
+    }
+
+    /* TODO: Error, cancel pending request / response. */
+  }
+
   /* Run disconnect callback. */
   if (api->cb_disconnect != NULL)
     api->cb_disconnect(api, api->baton);
@@ -655,13 +671,18 @@ void connection_fault(struct http_client *api, enum connection_fault fault)
   /* Set status FSM. */
   api->state = HTTP_NOT_CONNECTED;
 
-  /* Process remaning requests. */
-  if (fault == FAULT_CLOSE) {
-    /* TODO: reconnect and do work. */
+  /* Reset BIO but try to keep resume SSL session on reconnect. */
+  if (api->connection.ssl_ctx) {
+    BIO_reset(api->connection.buffer_io);
   }
 
-  /* Reset BIO but try to keep resume SSL session on reconnect. */
-  BIO_reset(api->connection.buffer_io);
+  /* Process remaning requests. */
+  if (fault == FAULT_CLOSE && !TAILQ_EMPTY(&api->pending_request)) {
+    if ((api->connection.buffer_io = connect_remote_host(api)) == NULL) {
+      /* Error, dump the queue. */
+      connection_fault(api, FAULT_ERROR);
+    }
+  }
 }
 
 static
